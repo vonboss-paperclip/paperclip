@@ -55,6 +55,7 @@ describeEmbeddedPostgres("productivity review service", () => {
     startedAt?: Date;
     parentId?: string | null;
     originKind?: string;
+    assigneeStatus?: string;
   }) {
     const companyId = randomUUID();
     const managerId = randomUUID();
@@ -86,7 +87,7 @@ describeEmbeddedPostgres("productivity review service", () => {
         companyId,
         name: "Coder",
         role: "engineer",
-        status: "idle",
+        status: opts?.assigneeStatus ?? "idle",
         reportsTo: managerId,
         adapterType: "codex_local",
         adapterConfig: {},
@@ -120,16 +121,20 @@ describeEmbeddedPostgres("productivity review service", () => {
     count: number;
     now: Date;
     withRunComments?: boolean;
+    spacingMs?: number;
+    status?: string;
+    errorCode?: string | null;
+    usageJson?: Record<string, unknown> | null;
   }) {
     const runs: Array<typeof heartbeatRuns.$inferInsert> = [];
     for (let index = 0; index < input.count; index += 1) {
       const runId = randomUUID();
-      const createdAt = new Date(input.now.getTime() - index * 60_000);
+      const createdAt = new Date(input.now.getTime() - index * (input.spacingMs ?? 60_000));
       runs.push({
         id: runId,
         companyId: input.companyId,
         agentId: input.agentId,
-        status: "succeeded",
+        status: input.status ?? "succeeded",
         invocationSource: "assignment",
         triggerDetail: "system",
         startedAt: createdAt,
@@ -137,6 +142,8 @@ describeEmbeddedPostgres("productivity review service", () => {
         contextSnapshot: { issueId: input.issueId, taskId: input.issueId },
         livenessState: "advanced",
         nextAction: "Continue processing the next batch.",
+        errorCode: input.errorCode ?? null,
+        usageJson: input.usageJson ?? undefined,
         createdAt,
         updatedAt: createdAt,
       });
@@ -208,6 +215,88 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).toContain("No-comment completed-run streak: 10");
 
     expect(await listRefreshComments(reviews[0]!.id)).toHaveLength(0);
+  });
+
+  it("skips candidates whose assignee is not invokable while still reviewing an invokable twin", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    // Same evidence on both sides; the ONLY difference is the assignee status.
+    const paused = await seedAssignedIssue({ assigneeStatus: "paused" });
+    const invokable = await seedAssignedIssue();
+    for (const seeded of [paused, invokable]) {
+      await insertRuns({
+        companyId: seeded.companyId,
+        agentId: seeded.coderId,
+        issueId: seeded.issueId,
+        count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+        now,
+      });
+    }
+
+    const service = productivityReviewService(db);
+    const pausedResult = await service.reconcileProductivityReviews({ now, companyId: paused.companyId });
+    const invokableResult = await service.reconcileProductivityReviews({ now, companyId: invokable.companyId });
+
+    // The paused candidate is in the scanned population — it is rejected by the guard, not absent.
+    expect(pausedResult.scanned).toBe(1);
+    expect(pausedResult.skipped).toBe(1);
+    expect(pausedResult.created).toBe(0);
+    expect(await listProductivityReviews(paused.companyId)).toHaveLength(0);
+
+    // Control: the same evidence on an invokable assignee still produces a review.
+    expect(invokableResult.created).toBe(1);
+    expect(await listProductivityReviews(invokable.companyId)).toHaveLength(1);
+  });
+
+  it("keeps runs that never got to write out of the no-comment streak while still reviewing runs that did", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    // 30 min apart and status "todo" so neither high churn nor long active duration can fire:
+    // the no-comment streak is the only trigger under test.
+    const runSpacingMs = 30 * 60_000;
+    const noOpportunity = await seedAssignedIssue({ status: "todo" });
+    const opportunity = await seedAssignedIssue({ status: "todo" });
+    await insertRuns({
+      companyId: noOpportunity.companyId,
+      agentId: noOpportunity.coderId,
+      issueId: noOpportunity.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      spacingMs: runSpacingMs,
+      status: "failed",
+      errorCode: "claude_transient_upstream",
+      usageJson: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+    });
+    await insertRuns({
+      companyId: opportunity.companyId,
+      agentId: opportunity.coderId,
+      issueId: opportunity.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      spacingMs: runSpacingMs,
+      usageJson: { inputTokens: 1200, cachedInputTokens: 0, outputTokens: 340 },
+    });
+
+    const service = productivityReviewService(db);
+    const noOpportunityResult = await service.reconcileProductivityReviews({
+      now,
+      companyId: noOpportunity.companyId,
+    });
+    const opportunityResult = await service.reconcileProductivityReviews({
+      now,
+      companyId: opportunity.companyId,
+    });
+
+    expect(noOpportunityResult.scanned).toBe(1);
+    expect(noOpportunityResult.created).toBe(0);
+    expect(await listProductivityReviews(noOpportunity.companyId)).toHaveLength(0);
+
+    // Control: identical timing, but the runs actually burned tokens — the streak still fires.
+    expect(opportunityResult.created).toBe(1);
+    const reviews = await listProductivityReviews(opportunity.companyId);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(reviews[0]?.description).toContain(
+      `No-comment completed-run streak: ${DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS}`,
+    );
   });
 
   it("refreshes open productivity reviews only once per interval and caps refresh comments", async () => {

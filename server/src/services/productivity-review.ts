@@ -35,6 +35,7 @@ export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CREATIONS_PER_WINDOW = 1;
 export const DEFAULT_PRODUCTIVITY_REVIEW_MAX_CONSECUTIVE_NO_ACTION_REVIEWS = 3;
 
 const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
+const NO_WRITE_OPPORTUNITY_ERROR_CODES = new Set<string>(["claude_transient_upstream"]);
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
@@ -206,6 +207,35 @@ function formatTrigger(trigger: ProductivityReviewTrigger) {
   if (trigger === "no_comment_streak") return "No-comment streak";
   if (trigger === "high_churn") return "High churn";
   return "Long active duration";
+}
+
+function readUsageTokens(usage: Record<string, unknown>, ...keys: string[]) {
+  for (const key of keys) {
+    const raw = usage[key];
+    const value = typeof raw === "number" ? raw : typeof raw === "string" && raw.trim() !== "" ? Number(raw) : Number.NaN;
+    if (Number.isFinite(value)) return Math.max(0, Math.floor(value));
+  }
+  return 0;
+}
+
+// A terminal run only belongs in the no-comment streak if it actually got a chance to write.
+// A run that died upstream, or that burned no tokens at all, never reached the agent: counting it
+// measures the platform, not the assignee.
+function runHadWriteOpportunity(run: HeartbeatRunRow) {
+  if (run.errorCode && NO_WRITE_OPPORTUNITY_ERROR_CODES.has(run.errorCode)) return false;
+  const usage = run.usageJson;
+  if (!usage || typeof usage !== "object" || Array.isArray(usage)) return true;
+  const totalTokens =
+    readUsageTokens(usage, "inputTokens", "input_tokens", "rawInputTokens", "raw_input_tokens") +
+    readUsageTokens(
+      usage,
+      "cachedInputTokens",
+      "cached_input_tokens",
+      "cacheReadInputTokens",
+      "cache_read_input_tokens",
+    ) +
+    readUsageTokens(usage, "outputTokens", "output_tokens", "rawOutputTokens", "raw_output_tokens");
+  return totalTokens > 0;
 }
 
 export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: EnqueueWakeup }) {
@@ -483,6 +513,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     let noCommentStreak = 0;
     for (const run of terminalRuns) {
       if (commentRunIds.has(run.id)) break;
+      if (!runHadWriteOpportunity(run)) continue;
       noCommentStreak += 1;
     }
 
@@ -879,6 +910,12 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       }
       const sourceAgent = await getAgent(candidate.assigneeAgentId);
       if (!sourceAgent || sourceAgent.companyId !== candidate.companyId) {
+        result.skipped += 1;
+        continue;
+      }
+      // A paused / terminated / pending-approval assignee cannot be invoked at all, so every
+      // productivity signal on its issue measures the pause rather than the agent.
+      if (!isAgentInvokable(sourceAgent)) {
         result.skipped += 1;
         continue;
       }
