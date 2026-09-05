@@ -1,12 +1,13 @@
 import type { UsageSummary } from "@paperclipai/adapter-utils";
 import {
   asString,
+  asBoolean,
   asNumber,
   parseObject,
   parseJson,
 } from "@paperclipai/adapter-utils/server-utils";
 
-const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+`?claude\s+login`?|login\s+required|requires\s+login|unauthorized|authentication\s+required)/i;
+const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+(?:`?claude\s+login`?|\/login)|login\s+required|requires\s+login|unauthorized|authentication\s+required|invalid\s+api\s+key[\s\S]{0,120}(?:\/login|claude\s+login|log\s+in))/i;
 const URL_RE = /(https?:\/\/[^\s'"`<>()[\]{};,!?]+[^\s'"`<>()[\]{};,!.?:]+)/gi;
 
 const CLAUDE_TRANSIENT_UPSTREAM_RE =
@@ -129,22 +130,62 @@ export function extractClaudeLoginUrl(text: string): string | null {
   return match[0]?.replace(/[\])}.!,?;:'\"]+$/g, "") ?? null;
 }
 
+function claudeAuthDiagnosticMessages(event: Record<string, unknown>): string[] {
+  const type = asString(event.type, "");
+  const subtype = asString(event.subtype, "").trim().toLowerCase();
+  const failedResult =
+    (type === "result" || type === "") &&
+    (asBoolean(event.is_error, false) || subtype === "error" || subtype.startsWith("error_"));
+
+  if (failedResult) {
+    return [asString(event.result, ""), ...extractClaudeErrorMessages(event)];
+  }
+  if (type === "error") {
+    const error = parseObject(event.error);
+    return [asString(event.message, ""), asString(event.error, ""), asString(error.message, "")];
+  }
+  if (type === "assistant" && event.error === "authentication_failed") {
+    // This is a CLI error marker, not assistant prose or a tool result.
+    return ["Authentication required"];
+  }
+  return [];
+}
+
 export function detectClaudeLoginRequired(input: {
   parsed: Record<string, unknown> | null;
   stdout: string;
   stderr: string;
 }): { requiresLogin: boolean; loginUrl: string | null } {
-  const resultText = asString(input.parsed?.result, "").trim();
-  const messages = [resultText, ...extractClaudeErrorMessages(input.parsed ?? {}), input.stdout, input.stderr]
-    .join("\n")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
+  // Keep URL discovery for the explicit `claude login` flow, including when
+  // there is no error. URLs do not contribute to the authentication verdict.
+  const loginUrl = extractClaudeLoginUrl([input.stdout, input.stderr].join("\n"));
+  const terminal = input.parsed ?? parseClaudeStreamJson(input.stdout).resultJson;
+  if (asString(terminal?.subtype, "").trim().toLowerCase() === "success" && !asBoolean(terminal?.is_error, false)) {
+    return { requiresLogin: false, loginUrl };
+  }
 
-  const requiresLogin = messages.some((line) => CLAUDE_AUTH_REQUIRED_RE.test(line));
+  const messages = terminal ? claudeAuthDiagnosticMessages(terminal) : [];
+  // Unstructured CLI startup failures still need a fallback. Match a diagnostic
+  // at the beginning of a line, not arbitrary source comments or quoted prose.
+  const plainDiagnostic = new RegExp(
+    `^(?:(?:API\\s+)?Error:\\s*(?:401\\s*)?|401\\s+)?${CLAUDE_AUTH_REQUIRED_RE.source}`,
+    "i",
+  );
+  for (const rawLine of [input.stdout, input.stderr].join("\n").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const event = parseJson(line);
+    if (event) {
+      // Never search serialized assistant/user/tool payloads. A JSONL record
+      // only supplies evidence through its designated diagnostic fields.
+      messages.push(...claudeAuthDiagnosticMessages(event));
+    } else if (plainDiagnostic.test(line)) {
+      messages.push(line);
+    }
+  }
   return {
-    requiresLogin,
-    loginUrl: extractClaudeLoginUrl([input.stdout, input.stderr].join("\n")),
+    requiresLogin: messages.some((message) => CLAUDE_AUTH_REQUIRED_RE.test(message)),
+    loginUrl,
   };
 }
 
