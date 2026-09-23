@@ -2463,6 +2463,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   });
   const workspaceOperationsSvc = workspaceOperationService(db);
   const activeRunExecutions = new Set<string>();
+  const activeRunExecutionPromises = new Set<Promise<void>>();
   const budgetHooks = {
     cancelWorkForScope: cancelBudgetScopeWork,
   };
@@ -6941,12 +6942,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (claimedRuns.length === 0) return [];
 
       for (const claimedRun of claimedRuns) {
-        void executeRun(claimedRun.id).catch((err) => {
+        const execution = executeRun(claimedRun.id).catch((err) => {
           logger.error({ err, runId: claimedRun.id }, "queued heartbeat execution failed");
+        }).finally(() => {
+          activeRunExecutionPromises.delete(execution);
         });
+        activeRunExecutionPromises.add(execution);
       }
       return claimedRuns;
     });
+  }
+
+  // Callers must await their wakeups before draining. A run's finally can dispatch
+  // another run, so drain successive snapshots under one deadline.
+  async function drainActiveRunExecutions(options: { timeoutMs?: number } = {}) {
+    const timeoutMs = options.timeoutMs ?? 5_000;
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+      throw new RangeError("Heartbeat execution drain timeoutMs must be finite and non-negative");
+    }
+    if (activeRunExecutionPromises.size === 0) return;
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`Timed out waiting for heartbeat run executions to drain after ${timeoutMs}ms`));
+      }, timeoutMs);
+    });
+    try {
+      while (activeRunExecutionPromises.size > 0) {
+        await Promise.race([Promise.all([...activeRunExecutionPromises]), timeout]);
+      }
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async function executeRun(runId: string) {
@@ -9706,6 +9734,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   return {
+    drainActiveRunExecutions,
     list: async (companyId: string, agentId?: string, limit?: number) => {
       const safeForLegacyEncoding = await hasUnsafeTextProjectionDatabase();
       const query = db
